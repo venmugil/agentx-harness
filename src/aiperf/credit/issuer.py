@@ -117,6 +117,7 @@ class CreditIssuer:
         self._cancellation_policy = cancellation_policy
         self._lifecycle = lifecycle
         self._url_selection_strategy = url_selection_strategy
+        self._url_index_by_correlation: dict[str, int] = {}
         # Tree accounting defaults to PROFILING-only (WARMUP keeps the legacy
         # in-flight teardown release), but ``session_tree_registry_enabled``
         # overrides that gate so accelerated agentic warmup -- which DOES open
@@ -439,6 +440,34 @@ class CreditIssuer:
 
         return await self._issue_credit_internal(turn)
 
+    def _url_index_for(self, turn: TurnToSend) -> int | None:
+        """Pick the URL index for a turn (multi-URL load balancing).
+
+        Session starts take the next index from the strategy. A continuation
+        whose session has no index in this phase (e.g. a subagent resumed
+        mid-trace with is_session_start=False) inherits its parent's or root's
+        index, else takes the next one, instead of falling back to URL 0.
+        Workers that already cache the session keep its stored index.
+        """
+        if self._url_selection_strategy is None:
+            return None
+        known = self._url_index_by_correlation
+        corr = turn.x_correlation_id
+        index = None
+        if not (turn.turn_index == 0 or turn.is_session_start):
+            for key in (
+                corr,
+                turn.parent_correlation_id,
+                turn.effective_root_correlation_id,
+            ):
+                if key is not None and key in known:
+                    index = known[key]
+                    break
+        if index is None:
+            index = self._url_selection_strategy.next_url_index()
+        known[corr] = index
+        return index
+
     async def _issue_credit_internal(self, turn: TurnToSend) -> bool:
         """Issue credit after slots are acquired. Mark as final if this was the final credit.
 
@@ -456,16 +485,7 @@ class CreditIssuer:
             time.perf_counter_ns() - self._lifecycle.started_at_perf_ns
         )
 
-        # Get URL index from strategy (for multi-URL load balancing).
-        # Only advance the round-robin when a session starts (turn 0 or a
-        # mid-trace resume). Continuations reuse the url_index stored in the
-        # worker's UserSession.
-        is_session_start = turn.turn_index == 0 or turn.is_session_start
-        url_index = (
-            self._url_selection_strategy.next_url_index()
-            if self._url_selection_strategy and is_session_start
-            else None
-        )
+        url_index = self._url_index_for(turn)
 
         cache_bust_marker = turn.cache_bust_marker
         cache_bust_target_for_credit = turn.cache_bust_target
